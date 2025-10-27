@@ -1,6 +1,9 @@
 # kokoro_tts_hybrid_cross.py — macOS & Windows GUI for Kokoro TTS
-# v4 — redesigned layout, history/presets, language & loudness controls, smarter status
+# v5.0 — faster voice scan (with cache), safer providers, fixed VOICE_CANDIDATES bug,
+#        tighter threading, improved progress/status, minor perf cleanup.
 # Platforms: macOS (Apple Silicon/CoreML, CPU) and Windows (CUDA/DirectML/CPU)
+
+from __future__ import annotations
 
 import json
 import os
@@ -15,6 +18,8 @@ import subprocess
 import platform
 import textwrap
 from pathlib import Path
+from typing import Iterable, Tuple
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
@@ -37,8 +42,52 @@ except Exception:
 
 from kokoro_onnx import Kokoro  # type: ignore
 
-# --- Online voice list utilities ---
-from typing import Iterable, Tuple
+# ============================ Config ============================
+BASE_DIR = Path(__file__).resolve().parent
+AUTO_DOWNLOAD = False  # True: auto download with huggingface_hub if missing
+MODEL_NAMES = ["kokoro-v1.0.onnx", "kokoro-v1.0.fp16.onnx"]  # FP16 may help CoreML
+VOICE_NAMES = ["voices-v1.0.bin", str(Path("voices") / "voices-v1.0.bin")]
+PRESETS_FILE = BASE_DIR / "kokoro_presets.json"
+VOICE_CACHE = BASE_DIR / ".voicecache.json"  # cache of validated voice IDs
+
+ONLINE_VOICE_SOURCES = [
+    "https://huggingface.co/hexgrad/Kokoro-82M/raw/main/VOICES.md",
+    "https://huggingface.co/onnx-community/Kokoro-82M-ONNX/raw/main/README.md",
+]
+
+# When offline or fetch fails, still show a few usable voices
+FALLBACK_VOICES = [
+    ("Bella — American English (F)", "af_bella"),
+    ("Heart — American English (F)", "af_heart"),
+    ("Michael — American English (M)", "am_michael"),
+    ("Fenrir — American English (M)", "am_fenrir"),
+]
+
+LANGUAGE_OPTIONS: list[tuple[str, str]] = [
+    ("English (US)", "en-us"),
+    ("English (UK)", "en-gb"),
+    ("English (Australia)", "en-au"),
+    ("English (India)", "en-in"),
+    ("Spanish", "es-es"),
+    ("French", "fr-fr"),
+    ("German", "de-de"),
+    ("Italian", "it-it"),
+    ("Portuguese (Brazil)", "pt-br"),
+    ("Japanese", "ja-jp"),
+    ("Korean", "ko-kr"),
+    ("Chinese (Simplified)", "zh-cn"),
+]
+
+# ============================ Small utilities ============================
+def _find_first(paths):
+    for p in paths:
+        pp = Path(p)
+        if pp.exists():
+            return pp
+    return None
+
+MODEL_PATH  = _find_first([BASE_DIR / n for n in MODEL_NAMES])
+VOICES_PATH = _find_first([BASE_DIR / n for n in VOICE_NAMES])
 
 def _http_get(url: str, timeout: float = 6.0) -> str | None:
     """Tiny HTTP GET with graceful fallbacks (requests -> urllib). Returns text or None."""
@@ -58,22 +107,13 @@ def _http_get(url: str, timeout: float = 6.0) -> str | None:
         return None
 
 def _title_case_id(vid: str) -> str:
-    """
-    Heuristic: 'af_bella' -> 'Bella'; 'bm_george' -> 'George'; 'zf_xiaoyi' -> 'Xiaoyi'
-    """
     base = vid.split("_", 1)[-1]
     return base.replace("-", " ").replace("_", " ").strip().title()
 
 def _region_gender_from_prefix(vid: str) -> tuple[str, str] | None:
-    """
-    Map voice-id prefix to region & gender.
-    a/b = English (American/British), j = Japanese, z = Mandarin Chinese,
-    e = Spanish, f = French, h = Hindi, i = Italian, p = Brazilian Portuguese
-    Second letter: f/m for (F/M).
-    """
     if len(vid) < 2 or "_" not in vid:
         return None
-    pref = vid.split("_", 1)[0]   # e.g. 'af'
+    pref = vid.split("_", 1)[0]
     if len(pref) != 2:
         return None
     lang_key = pref[0]
@@ -93,33 +133,21 @@ def _region_gender_from_prefix(vid: str) -> tuple[str, str] | None:
     return (region_map.get(lang_key, "Unknown"), gender_map.get(sex_key, "?"))
 
 def _pretty_label_for_voice(vid: str) -> str:
-    """
-    Build a friendly label: 'Bella — American English (F)'
-    """
     name = _title_case_id(vid)
     rg = _region_gender_from_prefix(vid) or ("Unknown", "?")
     return f"{name} — {rg[0]} ({rg[1]})"
 
 def _parse_voice_ids_from_voices_md(md_text: str) -> list[str]:
-    """
-    Parse `VOICES.md` blocks to collect all backticked voice ids like `af_bella`.
-    """
     if not md_text:
         return []
-    # Most IDs are backticked in tables; we also accept plain tokens like af_bella at line starts.
     ids = set()
-    # Backticked refs:
     for m in re.finditer(r"`([a-z]{1,2}[fm]_[a-z0-9\-]+)`", md_text):
         ids.add(m.group(1).strip())
-    # Looser fallback (rare):
     for m in re.finditer(r"\b([abjzefhip][fm]_[a-z0-9\-]+)\b", md_text):
         ids.add(m.group(1).strip())
     return sorted(ids)
 
 def _parse_voice_ids_from_model_card(md_text: str) -> list[str]:
-    """
-    The ONNX model card has small tables like: Bella (`af_bella`)
-    """
     if not md_text:
         return []
     ids = set()
@@ -128,9 +156,7 @@ def _parse_voice_ids_from_model_card(md_text: str) -> list[str]:
     return sorted(ids)
 
 def fetch_online_voice_ids() -> list[str]:
-    """
-    Try each source in ONLINE_VOICE_SOURCES until one yields voice ids.
-    """
+    """Try each source in ONLINE_VOICE_SOURCES until one yields voice ids."""
     for url in ONLINE_VOICE_SOURCES:
         txt = _http_get(url)
         if not txt:
@@ -144,69 +170,24 @@ def fetch_online_voice_ids() -> list[str]:
     return []
 
 def format_voices_for_ui(vids: Iterable[str]) -> list[Tuple[str, str]]:
-    """
-    Turn voice ids into (label, id) for the Combobox.
-    """
-    out: list[Tuple[str, str]] = []
-    for vid in vids:
-        out.append((_pretty_label_for_voice(vid), vid))
-    # Sort by region then name for a nice UX
+    out: list[Tuple[str, str]] = [(_pretty_label_for_voice(vid), vid) for vid in vids]
     out.sort(key=lambda x: (x[0].split(" — ")[-1], x[0]))
     return out
 
+def _read_voice_cache() -> list[str]:
+    try:
+        data = json.loads(VOICE_CACHE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("valid_voice_ids"), list):
+            return [str(v) for v in data["valid_voice_ids"]]
+    except Exception:
+        pass
+    return []
 
-# ============================ Config ============================
-AUTO_DOWNLOAD = False  # Set True to auto-download with huggingface_hub (requires: pip install huggingface_hub)
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_NAMES = ["kokoro-v1.0.onnx", "kokoro-v1.0.fp16.onnx"]  # FP16 may help CoreML
-VOICE_NAMES = ["voices-v1.0.bin", str(Path("voices") / "voices-v1.0.bin")]
-PRESETS_FILE = BASE_DIR / "kokoro_presets.json"
-
-# --- Dynamic voice catalog (fetched online, validated locally) ---
-# Sources: official Kokoro voice list (VOICES.md) and ONNX model card voice table.
-ONLINE_VOICE_SOURCES = [
-    # Primary (structured): full, authoritative list with sections per language
-    "https://huggingface.co/hexgrad/Kokoro-82M/raw/main/VOICES.md",
-    # Backup (shorter table on ONNX card)
-    "https://huggingface.co/onnx-community/Kokoro-82M-ONNX/raw/main/README.md",
-]
-
-# When offline or a fetch fails, we still want a few to show up
-FALLBACK_VOICES = [
-    ("Bella — American (F)", "af_bella"),
-    ("Heart — American (F)", "af_heart"),
-    ("Michael — American (M)", "am_michael"),
-    ("Fenrir — American (M)", "am_fenrir"),
-]
-
-AVAILABLE_VOICES: list[tuple[str, str]] = []  # (label, voice_id) after validation
-
-
-LANGUAGE_OPTIONS: list[tuple[str, str]] = [
-    ("English (US)", "en-us"),
-    ("English (UK)", "en-gb"),
-    ("English (Australia)", "en-au"),
-    ("English (India)", "en-in"),
-    ("Spanish", "es-es"),
-    ("French", "fr-fr"),
-    ("German", "de-de"),
-    ("Italian", "it-it"),
-    ("Portuguese (Brazil)", "pt-br"),
-    ("Japanese", "ja-jp"),
-    ("Korean", "ko-kr"),
-    ("Chinese (Simplified)", "zh-cn"),
-]
-
-# ============================ Locate assets ============================
-def _find_first(paths):
-    for p in paths:
-        pp = Path(p)
-        if pp.exists():
-            return pp
-    return None
-
-MODEL_PATH  = _find_first([BASE_DIR / n for n in MODEL_NAMES])
-VOICES_PATH = _find_first([BASE_DIR / n for n in VOICE_NAMES])
+def _write_voice_cache(valid_ids: list[str]) -> None:
+    try:
+        VOICE_CACHE.write_text(json.dumps({"valid_voice_ids": valid_ids}, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 # ============================ Optional auto-download ============================
 def _maybe_download():
@@ -241,11 +222,12 @@ def _maybe_download():
             except Exception:
                 continue
 
-# ============================ Provider helpers (cross-platform) ============================
+# ============================ Provider helpers ============================
 def available_providers() -> set[str]:
-    # Examples: macOS {'CoreMLExecutionProvider', 'CPUExecutionProvider'}
-    # Windows {'CUDAExecutionProvider','DmlExecutionProvider','CPUExecutionProvider',...}
-    return set(ort.get_available_providers())
+    try:
+        return set(ort.get_available_providers())
+    except Exception:
+        return {"CPUExecutionProvider"}
 
 def _is_apple_silicon() -> bool:
     try:
@@ -304,147 +286,128 @@ def _assert_primary_provider(kokoro_obj, wanted_primary: str):
             return used
     return None
 
-# ============================ Model init ============================
+# ============================ Engine singleton ============================
 _kokoro: Kokoro | None = None
 _active_providers_str: str | None = None  # for UI
+_engine_lock = threading.Lock()
 
 def init_kokoro(providers_choice: str) -> Kokoro:
     """
     Create Kokoro with requested providers; assert primary if possible.
+    Thread-safe & cached.
     """
     global _kokoro, _active_providers_str
-    if _kokoro is not None:
+    with _engine_lock:
+        if _kokoro is not None:
+            return _kokoro
+
+        _maybe_download()
+        if MODEL_PATH is None or VOICES_PATH is None:
+            raise FileNotFoundError(
+                "Missing model files.\n"
+                "Place 'kokoro-v1.0.onnx' (or 'kokoro-v1.0.fp16.onnx') and 'voices-v1.0.bin' next to this script,\n"
+                "or enable AUTO_DOWNLOAD and install 'huggingface_hub'."
+            )
+
+        provs = resolve_providers(providers_choice)
+        primary = provs[0] if provs else "CPUExecutionProvider"
+
+        try:
+            _kokoro = Kokoro(str(MODEL_PATH), str(VOICES_PATH), providers=provs)  # type: ignore[arg-type]
+        except TypeError:
+            _kokoro = Kokoro(str(MODEL_PATH), str(VOICES_PATH))
+
+        # Assert/record used providers
+        try:
+            used = _session_providers_string(_kokoro)
+            _active_providers_str = used
+            try:
+                _assert_primary_provider(_kokoro, primary)
+            except RuntimeError as e:
+                # Still allow CPU to run; notify once
+                try:
+                    messagebox.showwarning("Requested accelerator not engaged", str(e))
+                except Exception:
+                    pass
+        except Exception:
+            _active_providers_str = "unknown"
+
+        # Warm-up (non-fatal if it fails)
+        try:
+            _kokoro.create("Hi", voice="af_bella", speed=1.0, lang="en-us")
+        except Exception:
+            pass
+
+        print("[Kokoro providers]", _active_providers_str)
         return _kokoro
 
-    _maybe_download()
-    if MODEL_PATH is None or VOICES_PATH is None:
-        raise FileNotFoundError(
-            "Missing model files.\n"
-            "Place 'kokoro-v1.0.onnx' (or 'kokoro-v1.0.fp16.onnx') and 'voices-v1.0.bin' next to this script,\n"
-            "or enable AUTO_DOWNLOAD and install 'huggingface_hub'."
-        )
+# ============================ Voice validation (async) ============================
+AVAILABLE_VOICES: list[tuple[str, str]] = []  # (label, voice_id) after validation
 
-    provs = resolve_providers(providers_choice)
-    primary = provs[0] if provs else "CPUExecutionProvider"
-
-    try:
-        _kokoro = Kokoro(str(MODEL_PATH), str(VOICES_PATH), providers=provs)  # type: ignore[arg-type]
-    except TypeError:
-        _kokoro = Kokoro(str(MODEL_PATH), str(VOICES_PATH))
-
-    # Assert/record used providers
-    try:
-        used = _session_providers_string(_kokoro)
-        _active_providers_str = used
-        try:
-            _assert_primary_provider(_kokoro, primary)
-        except RuntimeError as e:
-            # Still allow CPU to run; notify once
-            messagebox.showwarning("Requested accelerator not engaged", str(e))
-    except Exception:
-        _active_providers_str = "unknown"
-
-    # Warm-up to cut first-latency cost
-    try:
-        _kokoro.create("Hi", voice="af_bella", speed=1.0, lang="en-us")
-    except Exception:
-        pass
-
-    print("[Kokoro providers]", _active_providers_str)
-    return _kokoro
-
-# ============================ Voice validation ============================
 def validate_voices_async(compute_choice: str, on_done):
     """
-    1) Fetch the *full* list of Kokoro voices online (VOICES.md / README).
+    1) Fetch the *full* list of Kokoro voices online (VOICES.md/README) or use cache/fallback.
     2) Validate which ones are truly usable with the user's local voices pack
        by attempting a tiny synthesis call per-id.
-    3) If offline, fall back to a small baked list so the app still works.
+    3) Cache valid IDs to speed up future launches.
     Calls on_done(valid_list) back on the Tk thread.
     """
     def worker():
         valid: list[tuple[str, str]] = []
-        exc_first = None
+        exc_first: Exception | None = None
 
-        # Step A: collect every known voice id from the internet
+        # Step A: gather candidates
+        online_ids: list[str] = []
         try:
             online_ids = fetch_online_voice_ids()
         except Exception as e:
-            online_ids = []
             exc_first = exc_first or e
 
-        # Step B: initialize model (may trigger auto-download if you enabled it)
+        if not online_ids:
+            # Use cache if any
+            cached = _read_voice_cache()
+            if cached:
+                online_ids = cached
+
+        if not online_ids:
+            # Fallback to a tiny known-good subset
+            online_ids = [vid for _lbl, vid in FALLBACK_VOICES]
+
+        # Step B: init engine
         try:
             k = init_kokoro(compute_choice)
         except Exception as e:
             k = None
             exc_first = exc_first or e
 
-        # Step C: probe each voice against the local voices pack
-        # If no online catalog, try the small fallback list.
-        probe_ids = online_ids if online_ids else [vid for _lbl, vid in FALLBACK_VOICES]
-
+        # Step C: probe each voice quickly
+        valid_ids: list[str] = []
         if k is not None:
-            for vid in probe_ids:
+            for vid in online_ids:
                 try:
-                    # very short test, fast and silent
                     k.create("Hi", voice=vid, speed=1.0, lang="en-us")
-                    valid.append((_pretty_label_for_voice(vid), vid))
+                    valid_ids.append(vid)
                 except Exception:
-                    # voice id exists online but not in this voices.bin — skip it
                     continue
 
-        # Step D: if absolutely nothing validated, ensure the UI isn’t empty
-        if not valid and not exc_first:
-            valid = FALLBACK_VOICES
+        # Step D: if nothing validated, fallback UI still shouldn’t be empty
+        if not valid_ids:
+            valid_ui = FALLBACK_VOICES
+        else:
+            _write_voice_cache(valid_ids)
+            valid_ui = format_voices_for_ui(valid_ids)
 
         def finish():
-            nonlocal exc_first
-            if exc_first and not valid:
+            if exc_first and not valid_ui:
                 messagebox.showerror("Voice scan failed", str(exc_first))
                 on_done([])
             else:
-                on_done(valid)
+                on_done(valid_ui)
 
         try:
             app.after(0, finish)  # type: ignore[name-defined]
         except Exception:
             finish()
-
-    threading.Thread(target=worker, daemon=True).start()
-
-    """
-    Validate which voice IDs actually exist in voices-v1.0.bin.
-    Calls on_done(valid_list) back on the Tk thread.
-    """
-    def worker():
-        valid: list[tuple[str, str]] = []
-        exc_first = None
-        try:
-            k = init_kokoro(compute_choice)
-        except Exception as e:
-            exc_first = e
-            k = None
-
-        if k is not None:
-            for label, vid in VOICE_CANDIDATES:
-                try:
-                    k.create("Hi", voice=vid, speed=1.0, lang="en-us")
-                    valid.append((label, vid))
-                except Exception:
-                    continue
-
-        def finish():
-            if exc_first:
-                messagebox.showerror("Voice scan failed", str(exc_first))
-                on_done([])
-            else:
-                on_done(valid)
-
-        try:
-            app.after(0, finish)  # type: ignore[name-defined]
-        except Exception:
-            on_done(valid)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -619,7 +582,6 @@ def save_wav_chunked(samples: np.ndarray, sr: int, fpath: str, progress_cb=None,
 
 # ============================ Diagnostics helpers ============================
 def _get_metal_info() -> str | None:
-    # Try to fetch GPU / Metal info (macOS)
     if platform.system() != "Darwin": return None
     try:
         out = subprocess.check_output(["/usr/sbin/system_profiler", "SPDisplaysDataType"], timeout=2)
@@ -632,7 +594,6 @@ def _get_metal_info() -> str | None:
     return None
 
 def _get_gpu_name_cuda() -> str | None:
-    # Windows/NVIDIA: nvidia-smi
     try:
         out = subprocess.check_output(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], timeout=1)
         lines = out.decode(errors="ignore").strip().splitlines()
@@ -665,7 +626,6 @@ def get_diagnostics_text() -> str:
     lines.append(f"presets file: {PRESETS_FILE}")
     return "\n".join(lines)
 
-
 def _humanize_duration(seconds: float) -> str:
     seconds = max(0.0, seconds)
     mins = int(seconds // 60)
@@ -687,8 +647,8 @@ class KokoroApp(tk.Tk):
         self.geometry("1040x720")
         self.minsize(900, 640)
 
-        self._last_compute_choice = None
-        self._last_voice_vid = None
+        self._last_compute_choice: str | None = None
+        self._last_voice_vid: str | None = None
         self._history_id = 0
         self.history_data: list[dict[str, object]] = []
         self.presets: list[dict[str, object]] = []
@@ -741,13 +701,7 @@ class KokoroApp(tk.Tk):
 
         # Context menu
         self._ctx = tk.Menu(self, tearoff=0)
-        for label, ev in [
-            ("Cut", "<<Cut>>"),
-            ("Copy", "<<Copy>>"),
-            ("Paste", "<<Paste>>"),
-            (None, None),
-            ("Select All", "<<SelectAll>>"),
-        ]:
+        for label, ev in [("Cut", "<<Cut>>"), ("Copy", "<<Copy>>"), ("Paste", "<<Paste>>"), (None, None), ("Select All", "<<SelectAll>>")]:
             if label is None:
                 self._ctx.add_separator()
             else:
@@ -795,13 +749,7 @@ class KokoroApp(tk.Tk):
         self.speed_value_lbl.grid(row=0, column=2, padx=(8, 0))
 
         ttk.Label(perf_group, text="Loudness:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(2, 2))
-        self.volume_scale = ttk.Scale(
-            perf_group,
-            from_=-6.0,
-            to=6.0,
-            variable=self.volume_var,
-            command=self._on_volume_changed,
-        )
+        self.volume_scale = ttk.Scale(perf_group, from_=-6.0, to=6.0, variable=self.volume_var, command=self._on_volume_changed)
         self.volume_scale.grid(row=1, column=1, sticky="ew", pady=(2, 2))
         self.volume_value_lbl = ttk.Label(perf_group, text="0.0 dB")
         self.volume_value_lbl.grid(row=1, column=2, padx=(8, 0))
@@ -882,15 +830,7 @@ class KokoroApp(tk.Tk):
             "action": "Action",
             "preview": "Preview",
         }
-        widths = {
-            "time": 80,
-            "voice": 140,
-            "speed": 70,
-            "lang": 80,
-            "gain": 70,
-            "action": 110,
-            "preview": 260,
-        }
+        widths = {"time": 80, "voice": 140, "speed": 70, "lang": 80, "gain": 70, "action": 110, "preview": 260}
         for col in columns:
             self.history_tree.heading(col, text=headings[col])
             self.history_tree.column(col, width=widths[col], anchor="w")
@@ -908,9 +848,7 @@ class KokoroApp(tk.Tk):
         history_btns.columnconfigure(2, weight=1)
 
         ttk.Button(history_btns, text="Load text", command=self._on_history_load_text).grid(row=0, column=0, sticky="ew")
-        ttk.Button(history_btns, text="Apply settings", command=self._on_history_apply_settings).grid(
-            row=0, column=1, sticky="ew", padx=(6, 6)
-        )
+        ttk.Button(history_btns, text="Apply settings", command=self._on_history_apply_settings).grid(row=0, column=1, sticky="ew", padx=(6, 6))
         ttk.Button(history_btns, text="Speak again", command=self._on_history_speak).grid(row=0, column=2, sticky="ew")
 
         ttk.Label(history_btns, text="Double-click an entry to load its text.", foreground="#666").grid(
@@ -939,21 +877,12 @@ class KokoroApp(tk.Tk):
         preset_btns.columnconfigure(2, weight=1)
 
         ttk.Button(preset_btns, text="Apply", command=self._apply_preset).grid(row=0, column=0, sticky="ew")
-        ttk.Button(preset_btns, text="Save new…", command=self._save_preset_as_new).grid(
-            row=0, column=1, sticky="ew", padx=6
-        )
+        ttk.Button(preset_btns, text="Save new…", command=self._save_preset_as_new).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Button(preset_btns, text="Update", command=self._update_selected_preset).grid(row=0, column=2, sticky="ew")
 
-        ttk.Button(presets_tab, text="Delete", command=self._delete_selected_preset).grid(
-            row=3, column=0, sticky="ew", pady=(0, 8)
-        )
+        ttk.Button(presets_tab, text="Delete", command=self._delete_selected_preset).grid(row=3, column=0, sticky="ew", pady=(0, 8))
 
-        ttk.Label(
-            presets_tab,
-            text=f"Stored at: {PRESETS_FILE}",
-            foreground="#666",
-            wraplength=320,
-        ).grid(row=4, column=0, sticky="w")
+        ttk.Label(presets_tab, text=f"Stored at: {PRESETS_FILE}", foreground="#666", wraplength=320).grid(row=4, column=0, sticky="w")
 
     # -------- Helpers --------
     def _bind_shortcuts(self):
@@ -1047,32 +976,24 @@ class KokoroApp(tk.Tk):
             return
         self._set_voice_by_id(str(preset.get("voice", "")))
         self._set_language_by_code(str(preset.get("language", "")))
-        if "speed" in preset:
-            self.speed_var.set(float(preset.get("speed", 1.0)))
-        if "volume_db" in preset:
-            self.volume_var.set(float(preset.get("volume_db", 0.0)))
+        if "speed" in preset: self.speed_var.set(float(preset.get("speed", 1.0)))
+        if "volume_db" in preset: self.volume_var.set(float(preset.get("volume_db", 0.0)))
         compute = preset.get("compute")
-        if compute:
-            self.compute_combo.set(str(compute))
-        self._update_speed_label()
-        self._update_volume_label()
-        self._update_char_counter()
+        if compute: self.compute_combo.set(str(compute))
+        self._update_speed_label(); self._update_volume_label(); self._update_char_counter()
         self.status.set(f"Applied preset: {preset.get('name')}")
 
     def _save_preset_as_new(self):
         name = simpledialog.askstring("Preset name", "Save current settings as:", parent=self)
-        if not name:
-            return
+        if not name: return
         name = name.strip()
-        if not name:
-            return
+        if not name: return
         existing = next((p for p in self.presets if p.get("name") == name), None)
         preset = self._current_settings_as_preset(name)
         if existing:
             if not messagebox.askyesno("Overwrite preset", f"Preset '{name}' exists. Overwrite it?"):
                 return
-            existing.clear()
-            existing.update(preset)
+            existing.clear(); existing.update(preset)
         else:
             self.presets.append(preset)
         self.preset_var.set(name)
@@ -1085,8 +1006,7 @@ class KokoroApp(tk.Tk):
         if not preset:
             messagebox.showinfo("Presets", "Select a preset to update.")
             return
-        preset.clear()
-        preset.update(self._current_settings_as_preset(self.preset_var.get()))
+        preset.clear(); preset.update(self._current_settings_as_preset(self.preset_var.get()))
         self._save_presets()
         self.status.set(f"Updated preset: {self.preset_var.get()}")
 
@@ -1114,7 +1034,7 @@ class KokoroApp(tk.Tk):
         return None
 
     def _voice_label_for_id(self, voice_id: str) -> str:
-        source = AVAILABLE_VOICES if AVAILABLE_VOICES else VOICE_CANDIDATES[:4]
+        source = AVAILABLE_VOICES if AVAILABLE_VOICES else FALLBACK_VOICES
         for label, vid in source:
             if vid == voice_id:
                 return f"{label} ({vid})"
@@ -1133,44 +1053,21 @@ class KokoroApp(tk.Tk):
     ):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         preview = textwrap.shorten(" ".join(text.split()), width=120, placeholder="…") if text else "(empty)"
-        iid = f"h{self._history_id}"
-        self._history_id += 1
+        iid = f"h{self._history_id}"; self._history_id += 1
         entry = {
-            "iid": iid,
-            "time": timestamp,
-            "text": text,
-            "voice": voice,
-            "language": lang,
-            "speed": speed,
-            "volume_db": boost_db,
-            "action": action,
-            "filepath": filepath,
-            "compute": compute,
+            "iid": iid, "time": timestamp, "text": text, "voice": voice, "language": lang,
+            "speed": speed, "volume_db": boost_db, "action": action, "filepath": filepath, "compute": compute,
         }
         self.history_data.insert(0, entry)
-        action_desc = action
-        if filepath:
-            action_desc = f"{action} ({Path(filepath).name})"
+        action_desc = f"{action} ({Path(filepath).name})" if filepath else action
         self.history_tree.insert(
-            "",
-            0,
-            iid=iid,
-            values=(
-                timestamp,
-                self._voice_label_for_id(voice),
-                f"{speed:.1f}×",
-                lang,
-                f"{boost_db:+.1f} dB",
-                action_desc,
-                preview,
-            ),
+            "", 0, iid=iid,
+            values=(timestamp, self._voice_label_for_id(voice), f"{speed:.1f}×", lang, f"{boost_db:+.1f} dB", action_desc, preview),
         )
         if len(self.history_data) > self.HISTORY_LIMIT:
             old = self.history_data.pop()
-            try:
-                self.history_tree.delete(old.get("iid"))
-            except Exception:
-                pass
+            try: self.history_tree.delete(old.get("iid"))
+            except Exception: pass
 
     def _set_text(self, text: str):
         self.text_box.delete("1.0", "end")
@@ -1179,7 +1076,7 @@ class KokoroApp(tk.Tk):
         self._update_char_counter()
 
     def _set_voice_by_id(self, voice_id: str) -> bool:
-        source = AVAILABLE_VOICES if AVAILABLE_VOICES else VOICE_CANDIDATES[:4]
+        source = AVAILABLE_VOICES if AVAILABLE_VOICES else FALLBACK_VOICES
         data = [f"{label}  ({vid})" for (label, vid) in source]
         self.voice_combo.configure(values=data)
         for idx, (_, vid) in enumerate(source):
@@ -1206,15 +1103,10 @@ class KokoroApp(tk.Tk):
     def _apply_history_settings(self, entry):
         self._set_voice_by_id(str(entry.get("voice", "")))
         self._set_language_by_code(str(entry.get("language", "")))
-        if "speed" in entry:
-            self.speed_var.set(float(entry.get("speed", 1.0)))
-        if "volume_db" in entry:
-            self.volume_var.set(float(entry.get("volume_db", 0.0)))
-        if entry.get("compute"):
-            self.compute_combo.set(str(entry.get("compute")))
-        self._update_speed_label()
-        self._update_volume_label()
-        self._update_char_counter()
+        if "speed" in entry: self.speed_var.set(float(entry.get("speed", 1.0)))
+        if "volume_db" in entry: self.volume_var.set(float(entry.get("volume_db", 0.0)))
+        if entry.get("compute"): self.compute_combo.set(str(entry.get("compute")))
+        self._update_speed_label(); self._update_volume_label(); self._update_char_counter()
 
     def _on_history_apply_settings(self):
         entry = self._history_selection()
@@ -1275,7 +1167,7 @@ class KokoroApp(tk.Tk):
 
     # -------- Helpers --------
     def _voice_id(self):
-        src = AVAILABLE_VOICES if AVAILABLE_VOICES else VOICE_CANDIDATES[:4]
+        src = AVAILABLE_VOICES if AVAILABLE_VOICES else FALLBACK_VOICES
         if not src:
             raise RuntimeError("No voices available")
         idx = self.voice_combo.current()
@@ -1335,7 +1227,7 @@ class KokoroApp(tk.Tk):
         self.provider_lbl.config(text=f"Active providers: {text}")
 
     def _populate_voices(self, voices_list: list[tuple[str,str]]):
-        source = voices_list if voices_list else VOICE_CANDIDATES[:4]
+        source = voices_list if voices_list else FALLBACK_VOICES
         if not source:
             self.voice_combo.configure(values=["(no voices)"])
             self.voice_combo.set("(no voices)")
@@ -1361,7 +1253,7 @@ class KokoroApp(tk.Tk):
             global AVAILABLE_VOICES
             AVAILABLE_VOICES = valid_list
             self._populate_voices(AVAILABLE_VOICES)
-            n = len(AVAILABLE_VOICES) if AVAILABLE_VOICES else len(VOICE_CANDIDATES[:4])
+            n = len(AVAILABLE_VOICES) if AVAILABLE_VOICES else len(FALLBACK_VOICES)
             self.status.set(f"Ready — {n} voice(s) available")
             self.rescan_btn.config(state="normal")
 
@@ -1396,7 +1288,7 @@ class KokoroApp(tk.Tk):
         compute_choice = self.compute_combo.get()
         need_reinit = (self._last_compute_choice != compute_choice)
 
-        self.speak_btn.config(state="disabled")
+        self.speak_btn.config(state="disabled"); self.save_btn.config(state="disabled")
         summary = f"Synthesizing… ({voice_id}, {lang}, {speed:.1f}×)"
         self.pbar_text_progress(1, summary)
 
@@ -1404,7 +1296,8 @@ class KokoroApp(tk.Tk):
             global _kokoro, _active_providers_str
             try:
                 if need_reinit:
-                    _kokoro = None
+                    with _engine_lock:
+                        _kokoro = None
                     self._last_compute_choice = compute_choice
 
                 kokoro = init_kokoro(compute_choice)
@@ -1426,12 +1319,13 @@ class KokoroApp(tk.Tk):
                 self.after(0, self.pbar_done, "Error")
                 self.after(0, lambda: messagebox.showerror("Error", f"Speech generation failed:\n{e}"))
                 self.after(0, lambda: self.speak_btn.config(state="normal"))
+                self.after(0, lambda: self.save_btn.config(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_playback_finished(self):
         self.pbar_done("Playback finished")
-        self.speak_btn.config(state="normal")
+        self.speak_btn.config(state="normal"); self.save_btn.config(state="normal")
 
     def on_save(self):
         text = self.text_box.get("1.0", "end").strip()
@@ -1462,7 +1356,8 @@ class KokoroApp(tk.Tk):
             global _kokoro, _active_providers_str
             try:
                 if need_reinit:
-                    _kokoro = None
+                    with _engine_lock:
+                        _kokoro = None
                     self._last_compute_choice = compute_choice
 
                 kokoro = init_kokoro(compute_choice)
